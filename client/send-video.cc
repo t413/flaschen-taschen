@@ -14,6 +14,7 @@ extern "C" {
 #  include <libavcodec/avcodec.h>
 #  include <libavformat/avformat.h>
 #  include <libswscale/swscale.h>
+#  include <ao/ao.h>
 }
 
 #include <stdio.h>
@@ -43,7 +44,7 @@ static void InterruptHandler(int) {
 #  define av_frame_free avcodec_free_frame
 #endif
 
-bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, bool verbose, float repeats);
+bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, ao_device* adevice, bool verbose, float repeats);
 
 void SendFrame(AVFrame *pFrame, UDPFlaschenTaschen *display) {
     // Write pixel data
@@ -124,13 +125,26 @@ int main(int argc, char *argv[]) {
     av_register_all();
     avformat_network_init();
 
+    //ininialize audio output
+    ao_initialize();
+    ao_sample_format format;
+    format.bits = 16;
+    format.channels = 2;
+    format.rate = 44100;
+    format.byte_format = AO_FMT_LITTLE;
+    int driver_id = ao_default_driver_id();
+    ao_device* adevice = ao_open_live(driver_id, &format, NULL);
+    if (adevice)
+        fprintf(stderr, "Outputing audio to device %d\n", driver_id);
+    else fprintf(stderr, "No audio output\n");
+
     signal(SIGTERM, InterruptHandler);
     signal(SIGINT, InterruptHandler);
 
     for (int imgarg = optind; imgarg < argc && !interrupt_received; ++imgarg) {
         const char *movie_file = argv[imgarg];
 
-        PlayVideo(movie_file, display, verbose, repeatSeconds);
+        PlayVideo(movie_file, display, adevice, verbose, repeatSeconds);
 
         if (interrupt_received) {
             // Feedback for Ctrl-C, but most importantly, force a newline
@@ -145,7 +159,7 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, bool verbose, float repeats) {
+bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, ao_device* adevice, bool verbose, float repeats) {
     // Open video file
     AVFormatContext* pFormatCtx = NULL;
     if(avformat_open_input(&pFormatCtx, filename, NULL, NULL) != 0) {
@@ -166,17 +180,20 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, bool verbose, 
     }
 
     // Find the first video stream
-    int videoStream = -1;
+    int videoStream = -1, audioStream = -1;
     for(int i=0; i < (int)pFormatCtx->nb_streams; ++i) {
         if (pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
             videoStream=i;
-            break;
+        } else if (pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audioStream=i;
         }
     }
     if(videoStream==-1){
         fprintf(stderr, "Can't open stream for %s\n", filename);
         return false;
     }
+    if (audioStream == -1)
+      fprintf(stderr, "No audio stream found\n");
 
     // Get a pointer to the codec context for the video stream
     AVCodecContext* pCodecCtxOrig = pFormatCtx->streams[videoStream]->codec;
@@ -259,6 +276,10 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, bool verbose, 
                     // Save the frame to disk
                     SendFrame(pFrameRGB, &display);
                     frame_count++;
+                } else if (adevice && (packet.stream_index == audioStream)) {
+                    int len = avcodec_decode_audio4(pCodecCtx, pFrame, &frameFinished, &packet);
+                    if (frameFinished)
+                        ao_play(adevice, (char*)pFrame->extended_data[0], pFrame->linesize[0]);
                 }
                 usleep(frame_wait_micros);
             }

@@ -19,7 +19,7 @@ send-image : send-image.cc $(FTLIB)
 # We're using a couple of deprecated functions. Pull request to update this to
 # the latest libraries is welcome.
 send-video: send-video.cc $(FTLIB)
-	$(CXX) $(CXXFLAGS) -Wno-deprecated-declarations -o $@ $< $(FFMPEG_LDFLAGS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -Wno-deprecated-declarations -o $@ $< $(FFMPEG_LDFLAGS) $(LDFLAGS) -lao
 
 % : %.cc $(FTLIB)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
