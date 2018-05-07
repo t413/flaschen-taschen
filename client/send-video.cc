@@ -14,6 +14,7 @@ extern "C" {
 #  include <libavcodec/avcodec.h>
 #  include <libavformat/avformat.h>
 #  include <libswscale/swscale.h>
+#  include <libavutil/imgutils.h>
 }
 
 #include <stdio.h>
@@ -214,23 +215,17 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, int verbose, f
     if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0)
         return false; // Could not open codec
 
-    // Allocate video frame
+    // Allocate video frames
     AVFrame* pFrame = av_frame_alloc();
-
-    // Allocate an AVFrame structure
-    AVFrame* pFrameRGB = av_frame_alloc();
-    if (pFrameRGB == NULL)
+    AVFrame* pFrameRGB = av_frame_alloc(); //resized frame
+    if (pFrame == NULL || pFrameRGB == NULL)
         return false;
 
-    // Determine required buffer size and allocate buffer
-    int numBytes = avpicture_get_size(AV_PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height);
-    uint8_t* buffer = (uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
-
-    // Assign appropriate parts of buffer to image planes in pFrameRGB
-    // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
-    // of AVPicture
-    avpicture_fill((AVPicture *)pFrameRGB, buffer, AV_PIX_FMT_RGB24,
-                   pCodecCtx->width, pCodecCtx->height);
+    //initialize the frame buffer data
+    int sizeframe1 = av_image_alloc(pFrame->data,    pFrame->linesize,    pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, 1);
+    int sizeframe2 = av_image_alloc(pFrameRGB->data, pFrameRGB->linesize, display.width(),  display.height(),  AV_PIX_FMT_RGB24,   1);
+    if (sizeframe1 < 0 || sizeframe2 < 0)
+        return false;
 
     // initialize SWS context for software scaling
     struct SwsContext* sws_ctx = sws_getContext(pCodecCtx->width,
@@ -274,7 +269,7 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, int verbose, f
             }
 
             // Free the packet that was allocated by av_read_frame
-            av_free_packet(&packet);
+            av_packet_unref(&packet);
         }
         repeated_count++; //if time allows- keep playing
 
@@ -282,24 +277,23 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, int verbose, f
         if (elapsed >= repeatTimeout * 1000)
             break;
 
-        av_seek_frame(pFormatCtx, -1, 1, AVSEEK_FLAG_FRAME); //start playing from the beginning
+        int retcode = av_seek_frame(pFormatCtx, videoStream, pFormatCtx->start_time, AVSEEK_FLAG_BACKWARD);
+        if (retcode < 0) { //start playing from the beginning
+            fprintf(stderr, "seeking to begining of file failed code %d\n", retcode);
+            return false;
+        }
         if (verbose > 1)
             fprintf(stderr, "loop %ld done after %0.1fs (%ld frames)\n", repeated_count, elapsed / 1000.0, frame_count);
     }
 
-    // Free the RGB image
-    av_free(buffer);
+    av_freep(&pFrameRGB->data[0]);
+    av_freep(&pFrame->data[0]);
     av_frame_free(&pFrameRGB);
-
-    // Free the YUV frame
     av_frame_free(&pFrame);
+    avcodec_free_context(&pCodecCtx); // Close the codec
+    avformat_close_input(&pFormatCtx); // Close the video file
+    sws_freeContext(sws_ctx);
 
-    // Close the codecs
-    avcodec_close(pCodecCtx);
-    avcodec_close(pCodecCtxOrig);
-
-    // Close the video file
-    avformat_close_input(&pFormatCtx);
     if (verbose)
         fprintf(stderr, "Finished playing %ld frames %ld times for %0.1fs total\n", frame_count, repeated_count, (GetTimeInMillis() - startTime) / 1000.);
     return !interrupt_received;
