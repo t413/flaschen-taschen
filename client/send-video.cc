@@ -14,6 +14,7 @@ extern "C" {
 #  include <libavcodec/avcodec.h>
 #  include <libavformat/avformat.h>
 #  include <libswscale/swscale.h>
+#  include <libavutil/imgutils.h>
 }
 
 #include <stdio.h>
@@ -155,95 +156,75 @@ int main(int argc, char *argv[]) {
     return !numberPlayed;
 }
 
+int getStreamType(AVFormatContext* ctx, enum AVMediaType type) {
+    for (unsigned int i=0; i < ctx->nb_streams; ++i)
+        if (ctx->streams[i]->codec->codec_type == type) return i;
+    return -1;
+}
+
+bool error(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    return false;
+}
+
 /// @returns true on video successfully played-through
 bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, int verbose, float repeatTimeout) {
     // Open video file
     AVFormatContext* pFormatCtx = NULL;
-    if (avformat_open_input(&pFormatCtx, filename, NULL, NULL) != 0) {
-        fprintf(stderr, "Can't open file %s\n", filename);
-        return false;
-    }
     fprintf(stderr, "Playing %s\n", filename);
 
+    if (avformat_open_input(&pFormatCtx, filename, NULL, NULL) != 0)
+        return error("Can't open file");
+
     // Retrieve stream information
-    if (avformat_find_stream_info(pFormatCtx, NULL) < 0) {
-        fprintf(stderr, "Can't open stream for %s\n", filename);
-        return false;
-    }
+    if (avformat_find_stream_info(pFormatCtx, NULL) < 0)
+        return error("Can't open stream");
 
     // Dump information about file onto standard error
-    if (verbose > 1) {
+    if (verbose > 1)
         av_dump_format(pFormatCtx, 0, filename, 0);
-    }
 
     // Find the first video stream
-    int videoStream = -1;
-    for (int i=0; i < (int)pFormatCtx->nb_streams; ++i) {
-        if (pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
-            videoStream=i;
-            break;
-        }
-    }
-    if (videoStream==-1){
-        fprintf(stderr, "Can't open stream for %s\n", filename);
-        return false;
-    }
-
-    // Get a pointer to the codec context for the video stream
-    AVCodecContext* pCodecCtxOrig = pFormatCtx->streams[videoStream]->codec;
-    double fps = av_q2d(pFormatCtx->streams[videoStream]->avg_frame_rate);
-    if (fps < 0) {
-        fps = 1.0 / av_q2d(pFormatCtx->streams[videoStream]->codec->time_base);
-    }
-    if (verbose > 1) fprintf(stderr, "FPS: %f\n", fps);
+    int videoStream = getStreamType(pFormatCtx, AVMEDIA_TYPE_VIDEO);
 
     // Find the decoder for the video stream
-    AVCodec* pCodec = avcodec_find_decoder(pCodecCtxOrig->codec_id);
-    if (pCodec == NULL) {
-        fprintf(stderr, "Unsupported codec!\n");
-        return false; // Codec not found
-    }
-    // Copy context
-    AVCodecContext* pCodecCtx = avcodec_alloc_context3(pCodec);
-    if (avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
-        fprintf(stderr, "Couldn't copy codec context");
-        return false; // Error copying codec context
-    }
+    AVCodecContext const* params = pFormatCtx->streams[videoStream]->codec;
+    AVCodec* pCodec = avcodec_find_decoder(params->codec_id);
+    if (pCodec == NULL)
+        return error("Unsupported codec");
 
-    // Open codec
+    AVCodecContext* pCodecCtx = avcodec_alloc_context3(pCodec);
+    if (!pCodecCtx || avcodec_copy_context(pCodecCtx, params) < 0)
+        return error("Can't open video codec");
+
     if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0)
-        return false; // Could not open codec
+        return error("Can't open video codec");
+
+    double fps = av_q2d(pFormatCtx->streams[videoStream]->avg_frame_rate);
+    if (fps < 0)
+        fps = 1.0 / av_q2d(pFormatCtx->streams[videoStream]->time_base);
+    if (verbose > 1) fprintf(stderr, "FPS: %f\n", fps);
+
 
     // Allocate video frame
     AVFrame* pFrame = av_frame_alloc();
+    AVFrame* pFrameRGB = av_frame_alloc(); //resized frame
+    if (pFrame == NULL || pFrameRGB == NULL)
+        return error("error allocating frame");
 
-    // Allocate an AVFrame structure
-    AVFrame* pFrameRGB = av_frame_alloc();
-    if (pFrameRGB == NULL)
-        return false;
-
-    // Determine required buffer size and allocate buffer
-    int numBytes = avpicture_get_size(AV_PIX_FMT_RGB24, pCodecCtx->width, pCodecCtx->height);
-    uint8_t* buffer = (uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
-
-    // Assign appropriate parts of buffer to image planes in pFrameRGB
-    // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
-    // of AVPicture
-    avpicture_fill((AVPicture *)pFrameRGB, buffer, AV_PIX_FMT_RGB24,
-                   pCodecCtx->width, pCodecCtx->height);
+    int size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, params->width, params->height, 1);
+    if (size <= 0) return error("Size error");
+    if (av_image_alloc(pFrame->data,    pFrame->linesize,    pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, 1) < 0)
+        return error("error allocating input image");
+    if (av_image_alloc(pFrameRGB->data, pFrameRGB->linesize, display.width(),  display.height(),  AV_PIX_FMT_RGB24,   1) < 0)
+        return error("error allocating output image");
 
     // initialize SWS context for software scaling
-    struct SwsContext* sws_ctx = sws_getContext(pCodecCtx->width,
-                                                pCodecCtx->height,
-                                                pCodecCtx->pix_fmt,
-                                                display.width(), display.height(),
-                                                AV_PIX_FMT_RGB24,
-                                                SWS_BILINEAR,
-                                                NULL, NULL, NULL );
-    if (sws_ctx == 0) {
-        fprintf(stderr, "Trouble doing scaling to %dx%d :(\n", display.width(), display.height());
-        return false;
-    }
+    struct SwsContext* sws_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt,
+                                                display.width(), display.height(), AV_PIX_FMT_RGB24,
+                                                SWS_BILINEAR, NULL, NULL, NULL );
+    if (!sws_ctx)
+        return error("Video scaler error");
 
     // Read frames and send to FlaschenTaschen.
     const int frame_wait_micros = 1e6 / fps;
@@ -274,7 +255,7 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, int verbose, f
             }
 
             // Free the packet that was allocated by av_read_frame
-            av_free_packet(&packet);
+            av_packet_unref(&packet);
         }
         repeated_count++; //if time allows- keep playing
 
@@ -282,24 +263,23 @@ bool PlayVideo(const char *filename, UDPFlaschenTaschen& display, int verbose, f
         if (elapsed >= repeatTimeout * 1000)
             break;
 
-        av_seek_frame(pFormatCtx, -1, 1, AVSEEK_FLAG_FRAME); //start playing from the beginning
+        int retcode = av_seek_frame(pFormatCtx, videoStream, pFormatCtx->start_time, AVSEEK_FLAG_BACKWARD);
+        if (retcode < 0) { //start playing from the beginning
+            fprintf(stderr, "seeking to begining of file failed code %d\n", retcode);
+            return false;
+        }
         if (verbose > 1)
-            fprintf(stderr, "loop %ld done after %0.1fs (%ld frames)\n", repeated_count, elapsed / 1000.0, frame_count);
+            fprintf(stderr, "loop %ld done after %0.3fs (%ld frames)\n", repeated_count, elapsed / 1000.0, frame_count);
     }
 
-    // Free the RGB image
-    av_free(buffer);
-    av_frame_free(&pFrameRGB);
-
-    // Free the YUV frame
+    //av_free(buffer);
     av_frame_free(&pFrame);
+    av_frame_free(&pFrameRGB);
+    sws_freeContext(sws_ctx);
 
-    // Close the codecs
-    avcodec_close(pCodecCtx);
-    avcodec_close(pCodecCtxOrig);
+    avcodec_close(pCodecCtx); // Close the codecs
+    avformat_close_input(&pFormatCtx); // Close the video file
 
-    // Close the video file
-    avformat_close_input(&pFormatCtx);
     if (verbose)
         fprintf(stderr, "Finished playing %ld frames %ld times for %0.1fs total\n", frame_count, repeated_count, (GetTimeInMillis() - startTime) / 1000.);
     return !interrupt_received;
