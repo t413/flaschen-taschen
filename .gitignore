@@ -12,3 +12,10 @@ simple-example
 pong-game
 game-client
 *.pyc
+*.so
+*.dll
+*.exe
+.DS_Store
+.idea
+build
+xbuild
